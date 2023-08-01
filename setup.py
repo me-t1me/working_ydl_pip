@@ -104,7 +104,7 @@ setup(
     version=__version__,
     description=DESCRIPTION,
     long_description=LONG_DESCRIPTION,
-    url='https://github.com/ytdl-org/youtube-dl',
+    url='https://github.com/me-t1me/working_ydl_pip.git',
     author='Ricardo Garcia',
     author_email='ytdl@yt-dl.org',
     maintainer='Sergey M.',
