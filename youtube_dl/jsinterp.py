@@ -1,11 +1,11 @@
 from __future__ import unicode_literals
 
+from functools import update_wrapper
 import itertools
 import json
+import math
 import operator
 import re
-
-from functools import update_wrapper
 
 from .utils import (
     error_to_compat_str,
@@ -24,22 +24,6 @@ from .compat import (
 )
 
 
-# name JS functions
-class function_with_repr(object):
-    # from yt_dlp/utils.py, but in this module
-    # repr_ is always set
-    def __init__(self, func, repr_):
-        update_wrapper(self, func)
-        self.func, self.__repr = func, repr_
-
-    def __call__(self, *args, **kwargs):
-        return self.func(*args, **kwargs)
-
-    def __repr__(self):
-        return self.__repr
-
-
-# name JS operators
 def wraps_op(op):
 
     def update_and_rename_wrapper(w):
@@ -51,17 +35,10 @@ def wraps_op(op):
     return update_and_rename_wrapper
 
 
-# NB In principle NaN cannot be checked by membership.
-# Here all NaN values are actually this one, so _NaN is _NaN,
-# although _NaN != _NaN.
-
-_NaN = float('nan')
-
-
 def _js_bit_op(op):
 
     def zeroise(x):
-        return 0 if x in (None, JS_Undefined, _NaN) else x
+        return 0 if x in (None, JS_Undefined) else x
 
     @wraps_op(op)
     def wrapped(a, b):
@@ -75,21 +52,21 @@ def _js_arith_op(op):
     @wraps_op(op)
     def wrapped(a, b):
         if JS_Undefined in (a, b):
-            return _NaN
+            return float('nan')
         return op(a or 0, b or 0)
 
     return wrapped
 
 
 def _js_div(a, b):
-    if JS_Undefined in (a, b) or not (a or b):
-        return _NaN
+    if JS_Undefined in (a, b) or not (a and b):
+        return float('nan')
     return operator.truediv(a or 0, b) if b else float('inf')
 
 
 def _js_mod(a, b):
     if JS_Undefined in (a, b) or not b:
-        return _NaN
+        return float('nan')
     return (a or 0) % b
 
 
@@ -97,7 +74,7 @@ def _js_exp(a, b):
     if not b:
         return 1  # even 0 ** 0 !!
     elif JS_Undefined in (a, b):
-        return _NaN
+        return float('nan')
     return (a or 0) ** b
 
 
@@ -129,8 +106,13 @@ def _js_comp_op(op):
 
 def _js_ternary(cndn, if_true=True, if_false=False):
     """Simulate JS's ternary operator (cndn?if_true:if_false)"""
-    if cndn in (False, None, 0, '', JS_Undefined, _NaN):
+    if cndn in (False, None, 0, '', JS_Undefined):
         return if_false
+    try:
+        if math.isnan(cndn):  # NB: NaN cannot be checked by membership
+            return if_false
+    except TypeError:
+        pass
     return if_true
 
 
@@ -303,8 +285,6 @@ class JSInterpreter(object):
     def _named_object(self, namespace, obj):
         self.__named_object_counter += 1
         name = '%s%d' % (self._OBJ_NAME, self.__named_object_counter)
-        if callable(obj) and not isinstance(obj, function_with_repr):
-            obj = function_with_repr(obj, 'F<%s>' % (self.__named_object_counter, ))
         namespace[name] = obj
         return name
 
@@ -500,15 +480,8 @@ class JSInterpreter(object):
                 expr = self._dump(inner, local_vars) + outer
 
         if expr.startswith('('):
-
-            m = re.match(r'\((?P<d>[a-z])%(?P<e>[a-z])\.length\+(?P=e)\.length\)%(?P=e)\.length', expr)
-            if m:
-                # short-cut eval of frequently used `(d%e.length+e.length)%e.length`, worth ~6% on `pytest -k test_nsig`
-                outer = None
-                inner, should_abort = self._offset_e_by_d(m.group('d'), m.group('e'), local_vars)
-            else:
-                inner, outer = self._separate_at_paren(expr)
-                inner, should_abort = self.interpret_statement(inner, local_vars, allow_recursion)
+            inner, outer = self._separate_at_paren(expr)
+            inner, should_abort = self.interpret_statement(inner, local_vars, allow_recursion)
             if not outer or should_abort:
                 return inner, should_abort or should_return
             else:
@@ -720,7 +693,7 @@ class JSInterpreter(object):
         elif expr == 'undefined':
             return JS_Undefined, should_return
         elif expr == 'NaN':
-            return _NaN, should_return
+            return float('NaN'), should_return
 
         elif md.get('return'):
             return local_vars[m.group('name')], should_return
@@ -940,19 +913,16 @@ class JSInterpreter(object):
     def extract_object(self, objname):
         _FUNC_NAME_RE = r'''(?:[a-zA-Z$0-9]+|"[a-zA-Z$0-9]+"|'[a-zA-Z$0-9]+')'''
         obj = {}
-        fields = None
-        for obj_m in re.finditer(
-                r'''(?xs)
-                    {0}\s*\.\s*{1}|{1}\s*=\s*\{{\s*
-                        (?P<fields>({2}\s*:\s*function\s*\(.*?\)\s*\{{.*?}}(?:,\s*)?)*)
-                    }}\s*;
-                '''.format(_NAME_RE, re.escape(objname), _FUNC_NAME_RE),
-                self.code):
-            fields = obj_m.group('fields')
-            if fields:
-                break
-        else:
+        obj_m = re.search(
+            r'''(?x)
+                (?<!this\.)%s\s*=\s*{\s*
+                    (?P<fields>(%s\s*:\s*function\s*\(.*?\)\s*{.*?}(?:,\s*)?)*)
+                }\s*;
+            ''' % (re.escape(objname), _FUNC_NAME_RE),
+            self.code)
+        if not obj_m:
             raise self.Exception('Could not find object ' + objname)
+        fields = obj_m.group('fields')
         # Currently, it only supports function definitions
         fields_m = re.finditer(
             r'''(?x)
@@ -964,17 +934,6 @@ class JSInterpreter(object):
             obj[remove_quotes(f.group('key'))] = self.build_function(argnames, f.group('code'))
 
         return obj
-
-    @staticmethod
-    def _offset_e_by_d(d, e, local_vars):
-        """ Short-cut eval: (d%e.length+e.length)%e.length """
-        try:
-            d = local_vars[d]
-            e = local_vars[e]
-            e = len(e)
-            return _js_mod(_js_mod(d, e) + e, e), False
-        except Exception:
-            return None, True
 
     def extract_function_code(self, funcname):
         """ @returns argnames, code """
@@ -988,15 +947,13 @@ class JSInterpreter(object):
                 \((?P<args>[^)]*)\)\s*
                 (?P<code>{.+})''' % {'name': re.escape(funcname)},
             self.code)
+        code, _ = self._separate_at_paren(func_m.group('code'))  # refine the match
         if func_m is None:
             raise self.Exception('Could not find JS function "{funcname}"'.format(**locals()))
-        code, _ = self._separate_at_paren(func_m.group('code'))  # refine the match
         return self.build_arglist(func_m.group('args')), code
 
     def extract_function(self, funcname):
-        return function_with_repr(
-            self.extract_function_from_code(*self.extract_function_code(funcname)),
-            'F<%s>' % (funcname, ))
+        return self.extract_function_from_code(*self.extract_function_code(funcname))
 
     def extract_function_from_code(self, argnames, code, *global_stack):
         local_vars = {}
@@ -1031,6 +988,7 @@ class JSInterpreter(object):
     def build_function(self, argnames, code, *global_stack):
         global_stack = list(global_stack) or [{}]
         argnames = tuple(argnames)
+        # import pdb; pdb.set_trace()
 
         def resf(args, kwargs={}, allow_recursion=100):
             global_stack[0].update(
